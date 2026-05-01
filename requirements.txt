@@ -1,0 +1,7 @@
+requests>=2.31.0
+pandas>=2.0.0
+schedule>=1.2.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+websocket-client>=1.6.0   # 실시간 체결 WebSocket (추후 사용)
