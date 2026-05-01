@@ -16,7 +16,7 @@ class MACrossStrategy(BaseStrategy):
 
     def generate_signals(self) -> list[OrderRequest]:
         raw = self.market.get_ohlcv(self.symbol)
-        df = pd.DataFrame(raw["output2"])
+        df = pd.DataFrame(raw["output"])
         df["close"] = df["stck_clpr"].astype(float)
         df = df.sort_values("stck_bsop_date")
 
