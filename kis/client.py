@@ -1,11 +1,17 @@
-"""KIS REST API 클라이언트 (저수준 HTTP 래퍼)"""
+"""KIS REST API client."""
+import os
 import time
-import requests
 from typing import Any
+
+import requests
+
 from config.settings import kis_config
 from kis.auth import KISAuth
 
-_MIN_INTERVAL = 1.1  # KIS API 초당 1건 제한 (모의투자 기준)
+
+_MIN_INTERVAL = float(os.getenv("KIS_MIN_INTERVAL", "2.0"))
+_TIMEOUT = 10
+_MAX_RETRIES = 3
 
 
 class KISClient:
@@ -13,6 +19,10 @@ class KISClient:
         self.auth = KISAuth()
         self.session = requests.Session()
         self._last_call: float = 0.0
+
+    @property
+    def min_interval(self) -> float:
+        return _MIN_INTERVAL
 
     def _throttle(self) -> None:
         elapsed = time.time() - self._last_call
@@ -27,7 +37,7 @@ class KISClient:
             "appkey": kis_config.app_key,
             "appsecret": kis_config.app_secret,
             "tr_id": tr_id,
-            "custtype": "P",  # 개인: P, 법인: B
+            "custtype": "P",
         }
         if extra:
             headers.update(extra)
@@ -35,18 +45,32 @@ class KISClient:
 
     def _raise_for_status(self, resp) -> None:
         if not resp.ok:
-            raise Exception(f"HTTP {resp.status_code} — {resp.text}")
+            raise Exception(f"HTTP {resp.status_code}: {resp.text}")
 
     def get(self, path: str, tr_id: str, params: dict) -> dict[str, Any]:
-        self._throttle()
         url = f"{kis_config.base_url}{path}"
-        resp = self.session.get(url, headers=self._headers(tr_id), params=params)
-        self._raise_for_status(resp)
-        return resp.json()
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                self._throttle()
+                resp = self.session.get(url, headers=self._headers(tr_id), params=params, timeout=_TIMEOUT)
+                self._raise_for_status(resp)
+                return resp.json()
+            except requests.RequestException:
+                if attempt == _MAX_RETRIES:
+                    raise
+                time.sleep(attempt * 1.5)
+        raise RuntimeError("unreachable")
 
     def post(self, path: str, tr_id: str, body: dict) -> dict[str, Any]:
-        self._throttle()
         url = f"{kis_config.base_url}{path}"
-        resp = self.session.post(url, headers=self._headers(tr_id), json=body)
-        self._raise_for_status(resp)
-        return resp.json()
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                self._throttle()
+                resp = self.session.post(url, headers=self._headers(tr_id), json=body, timeout=_TIMEOUT)
+                self._raise_for_status(resp)
+                return resp.json()
+            except requests.RequestException:
+                if attempt == _MAX_RETRIES:
+                    raise
+                time.sleep(attempt * 1.5)
+        raise RuntimeError("unreachable")
