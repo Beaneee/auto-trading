@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cycle-min", type=float, default=15, help="Reset batches every N minutes. Default: 15")
     parser.add_argument("--repeat-interval-min", type=float, default=0.1, help="Repeat interval while --until is set.")
     parser.add_argument("--until", help="Repeat until local time HH:MM.")
-    parser.add_argument("--until-us-close", action="store_true", help="Repeat until 06:00 KST, near US regular-market close.")
+    parser.add_argument("--until-us-close", action="store_true", help="Repeat until 05:00 KST, near US regular-market close during US daylight time.")
     parser.add_argument("--wait-for-us-open", action="store_true", help="Wait until 22:30 KST before starting.")
     parser.add_argument("--report-on-close", action="store_true", help="Generate a local daily report after the loop stops.")
     parser.add_argument("--market-guard", action="store_true", help="Block entries and use guarded stop loss.")
@@ -57,7 +57,7 @@ def main() -> int:
     if args.wait_for_us_open:
         wait_until_time("22:30")
     if args.until_us_close:
-        args.until = "06:00"
+        args.until = "05:00"
     if args.until:
         return repeat_until(args)
     return run_once(args)
