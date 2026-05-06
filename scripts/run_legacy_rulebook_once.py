@@ -27,6 +27,7 @@ from order.executor import OrderExecutor, OrderRequest, OrderType
 from order.portfolio import Portfolio
 from strategy.legacy_rulebook import LegacyRulebookStrategy
 from strategy.local_prescreen import DEFAULT_5M_CSV, describe_prescreen, prescreen_from_5m_csv
+from utils.trade_log import log_order
 
 
 DEFAULT_UNIVERSE = ROOT_DIR / "data" / "market_ohlcv" / "stock_universe_top100.csv"
@@ -86,6 +87,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repeat until local time HH:MM. Example: --until 16:00",
     )
     parser.add_argument(
+        "--until-kr-close",
+        action="store_true",
+        help="Repeat until the Korean regular market close, 15:30 local time.",
+    )
+    parser.add_argument(
+        "--wait-for-kr-open",
+        action="store_true",
+        help="Wait until 09:00 local time before starting.",
+    )
+    parser.add_argument(
+        "--report-on-close",
+        action="store_true",
+        help="Generate a local daily report after the repeat loop stops.",
+    )
+    parser.add_argument(
         "--repeat-interval-min",
         type=float,
         default=5.0,
@@ -138,6 +154,10 @@ def _read_symbol_csv(path: Path, limit: int | None = None) -> list[str]:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.wait_for_kr_open:
+        wait_until_time("09:00")
+    if args.until_kr_close:
+        args.until = "15:30"
     if args.until:
         return repeat_until(args)
     return run_once(args)
@@ -187,6 +207,8 @@ def repeat_until(args: argparse.Namespace) -> int:
         run_count += 1
 
     print(f"Stopped at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if args.report_on_close:
+        write_daily_report("kr")
     return exit_code
 
 
@@ -271,6 +293,17 @@ def run_once(args: argparse.Namespace) -> int:
             order_type=OrderType.MARKET,
         )
         result = executor.send(order)
+        log_order(
+            "kr",
+            {
+                "symbol": order.symbol,
+                "side": order.side.value,
+                "quantity": order.quantity,
+                "price": order.price,
+                "order_type": order.order_type,
+            },
+            result,
+        )
         print(f"{order.symbol} {order.side.value} qty={order.quantity}: {result}")
         if result.get("rt_cd") != "0":
             exit_code = 1
@@ -332,6 +365,29 @@ def _parse_until(value: str) -> datetime:
     if target <= now:
         raise ValueError(f"--until {value} is not in the future today.")
     return target
+
+
+def wait_until_time(value: str) -> None:
+    hour, minute = value.split(":", maxsplit=1)
+    now = datetime.now()
+    target = datetime.combine(now.date(), dt_time(hour=int(hour), minute=int(minute)))
+    if target <= now:
+        return
+    seconds = (target - now).total_seconds()
+    print(f"Waiting until {target.strftime('%Y-%m-%d %H:%M:%S')} before starting.")
+    time.sleep(seconds)
+
+
+def write_daily_report(market: str) -> None:
+    from scripts.generate_daily_report import build_report
+    from utils.trade_log import read_orders
+
+    yyyymmdd = datetime.now().strftime("%Y%m%d")
+    report = build_report(market, yyyymmdd, read_orders(market, yyyymmdd))
+    path = Path("reports") / f"{market}_{yyyymmdd}_report.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(report, encoding="utf-8")
+    print(f"Daily report written: {path}")
 
 
 if __name__ == "__main__":

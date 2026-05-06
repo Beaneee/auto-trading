@@ -1,0 +1,27 @@
+exchange,symbol,name,note
+NASD,NVDA,NVIDIA,AI semiconductor leader
+NASD,AMD,Advanced Micro Devices,AI semiconductor pullback watch
+NASD,AVGO,Broadcom,AI infrastructure leader
+NASD,ARM,Arm Holdings,semiconductor architecture leader
+NASD,SMCI,Super Micro Computer,AI server momentum watch
+NASD,TSM,Taiwan Semiconductor,foundry leader ADR
+NASD,ASML,ASML Holding,semiconductor equipment ADR
+NASD,MU,Micron Technology,memory cycle leader
+NASD,INTC,Intel,semiconductor rebound watch
+NASD,QCOM,Qualcomm,semiconductor largecap watch
+NASD,AAPL,Apple,largecap benchmark
+NASD,MSFT,Microsoft,largecap benchmark
+NASD,GOOGL,Alphabet,largecap benchmark
+NASD,AMZN,Amazon,largecap benchmark
+NASD,META,Meta Platforms,largecap benchmark
+NASD,TSLA,Tesla,high beta leader
+NASD,NFLX,Netflix,momentum largecap
+NASD,COST,Costco,defensive largecap
+NASD,ADBE,Adobe,software momentum
+NASD,CRWD,CrowdStrike,cybersecurity momentum
+NASD,PLTR,Palantir,AI software momentum
+NASD,COIN,Coinbase,crypto beta
+NASD,MSTR,MicroStrategy,bitcoin beta
+NYSE,JPM,JPMorgan Chase,financial benchmark
+NYSE,LLY,Eli Lilly,healthcare leader
+NYSE,UNH,UnitedHealth,healthcare benchmark
