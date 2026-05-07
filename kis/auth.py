@@ -28,6 +28,13 @@ class KISAuth:
         self._token: Token | None = None
         self._token_path = TOKEN_DIR / f"kis_token_{'real' if kis_config.is_real else 'sim'}.json"
 
+    def clear_token(self) -> None:
+        self._token = None
+        try:
+            self._token_path.unlink()
+        except FileNotFoundError:
+            pass
+
     def get_token(self) -> str:
         if self._token is None:
             self._token = self._load_token()

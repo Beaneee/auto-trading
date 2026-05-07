@@ -54,7 +54,11 @@ class KISClient:
                 self._throttle()
                 resp = self.session.get(url, headers=self._headers(tr_id), params=params, timeout=_TIMEOUT)
                 self._raise_for_status(resp)
-                return resp.json()
+                data = resp.json()
+                if self._is_token_expired_response(data) and attempt < _MAX_RETRIES:
+                    self.auth.clear_token()
+                    continue
+                return data
             except requests.RequestException:
                 if attempt == _MAX_RETRIES:
                     raise
@@ -68,9 +72,19 @@ class KISClient:
                 self._throttle()
                 resp = self.session.post(url, headers=self._headers(tr_id), json=body, timeout=_TIMEOUT)
                 self._raise_for_status(resp)
-                return resp.json()
+                data = resp.json()
+                if self._is_token_expired_response(data) and attempt < _MAX_RETRIES:
+                    self.auth.clear_token()
+                    continue
+                return data
             except requests.RequestException:
                 if attempt == _MAX_RETRIES:
                     raise
                 time.sleep(attempt * 1.5)
         raise RuntimeError("unreachable")
+
+    @staticmethod
+    def _is_token_expired_response(data: dict[str, Any]) -> bool:
+        message = str(data.get("msg1") or "")
+        code = str(data.get("msg_cd") or "")
+        return code == "EGW00123" or "token" in message.lower()

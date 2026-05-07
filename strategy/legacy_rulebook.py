@@ -3,7 +3,7 @@
 The strategy converts the provided rulebook into deterministic order signals:
 - portfolio value is split into three equal slots;
 - one symbol can occupy at most one slot;
-- entry requires the volume filter plus at least two technical confirmations;
+- entry looks for a volume expansion that is confirmed by upward price action;
 - exits prioritize capital protection before profit capture.
 """
 from __future__ import annotations
@@ -38,6 +38,7 @@ class LegacyRulebookStrategy(BaseStrategy):
     take_profit_pct = 1.0
     stop_loss_pct = -2.5
     guarded_stop_loss_pct = -1.0
+    volume_surge_ratio = 1.8
 
     def __init__(
         self,
@@ -45,17 +46,22 @@ class LegacyRulebookStrategy(BaseStrategy):
         symbols: list[str],
         snapshot: PortfolioSnapshot,
         market_guard_active: bool = False,
+        max_slots: int = 3,
+        total_budget: int | None = None,
     ):
         self.market = market
         self.symbols = symbols
         self.snapshot = snapshot
         self.market_guard_active = market_guard_active
+        self.max_slots = max_slots
+        self.total_budget = total_budget
 
     @property
     def slot_budget(self) -> int:
         if self.max_slots <= 0:
             return 0
-        return self.snapshot.total_value // self.max_slots
+        total_value = self.total_budget if self.total_budget else self.snapshot.total_value
+        return total_value // self.max_slots
 
     @property
     def available_slots(self) -> int:
@@ -113,27 +119,36 @@ class LegacyRulebookStrategy(BaseStrategy):
         curr = df.iloc[-1]
 
         confirmations: list[str] = []
-        if prev["ma5"] <= prev["ma20"] and curr["ma5"] > curr["ma20"]:
-            confirmations.append("ma5 crossed above ma20")
-        if prev["low"] <= prev["bb_lower"] and curr["close"] > curr["open"]:
-            confirmations.append("bollinger lower-band bounce")
-        if (prev["rsi14"] <= 30 < curr["rsi14"]) or (prev["rsi14"] < 50 <= curr["rsi14"]):
-            confirmations.append("rsi momentum cross")
-        if prev["macd"] <= prev["macd_signal"] and curr["macd"] > curr["macd_signal"]:
-            confirmations.append("macd signal cross")
+        volume_ratio = _safe_ratio(curr["volume"], curr["volume_ma20"])
+        body_position = _safe_ratio(curr["close"] - curr["low"], curr["high"] - curr["low"])
+        prior_high = df["high"].iloc[-6:-1].max()
 
-        volume_ok = curr["volume"] > curr["volume_ma5"]
-        if not volume_ok:
-            return RulebookDecision(symbol, None, 0, ["volume below 5-day average"], len(confirmations))
+        if volume_ratio >= self.volume_surge_ratio:
+            confirmations.append(f"volume surge {volume_ratio:.1f}x")
+        if curr["close"] > curr["open"] and body_position >= 0.65:
+            confirmations.append("bullish close near high")
+        if curr["close"] > prior_high:
+            confirmations.append("breakout above recent high")
+        if curr["close"] > curr["ma5"] and curr["ma5"] >= curr["ma20"]:
+            confirmations.append("price above rising short trend")
+        if curr["rsi14"] > prev["rsi14"] and curr["rsi14"] >= 50:
+            confirmations.append("rsi improving above 50")
+        if curr["macd_hist"] > prev["macd_hist"] and curr["macd_hist"] > 0:
+            confirmations.append("macd momentum expanding")
 
-        if len(confirmations) < 2:
-            return RulebookDecision(symbol, None, 0, confirmations or ["less than 2 confirmations"], len(confirmations))
+        has_volume_surge = any(reason.startswith("volume surge") for reason in confirmations)
+        bullish_score = len(confirmations) - (1 if has_volume_surge else 0)
+        if not has_volume_surge:
+            return RulebookDecision(symbol, None, 0, confirmations or [f"no volume surge {volume_ratio:.1f}x"], len(confirmations))
+
+        if bullish_score < 2:
+            return RulebookDecision(symbol, None, 0, confirmations or ["volume surge without bullish confirmation"], len(confirmations))
 
         quantity = self._buy_quantity(curr["close"])
         if quantity <= 0:
             return RulebookDecision(symbol, None, 0, ["slot budget or cash is too small"], len(confirmations))
 
-        return RulebookDecision(symbol, OrderSide.BUY, quantity, ["volume filter ok", *confirmations], len(confirmations))
+        return RulebookDecision(symbol, OrderSide.BUY, quantity, confirmations, len(confirmations))
 
     def _exit_decision(self, symbol: str, holding: Holding, df: pd.DataFrame) -> RulebookDecision:
         prev = df.iloc[-2]
@@ -143,6 +158,20 @@ class LegacyRulebookStrategy(BaseStrategy):
 
         if profit_rate <= stop_loss:
             return RulebookDecision(symbol, OrderSide.SELL, holding.quantity, [f"stop loss {profit_rate:.2f}% <= {stop_loss:.2f}%"])
+
+        volume_fade = curr["volume"] < curr["volume_ma5"] and curr["volume"] < prev["volume"]
+        momentum_fade = curr["macd_hist"] < prev["macd_hist"] or curr["rsi14"] < prev["rsi14"]
+        trend_break = curr["close"] < curr["ma5"]
+
+        if profit_rate > 0 and trend_break and (volume_fade or momentum_fade):
+            reasons = [f"momentum fade exit {profit_rate:.2f}%"]
+            if volume_fade:
+                reasons.append("volume fading")
+            if momentum_fade:
+                reasons.append("momentum weakening")
+            if trend_break:
+                reasons.append("close below ma5")
+            return RulebookDecision(symbol, OrderSide.SELL, holding.quantity, reasons)
 
         if profit_rate >= self.take_profit_pct:
             if curr["close"] >= curr["ma5"]:
@@ -186,6 +215,7 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ma5"] = df["close"].rolling(5).mean()
     df["ma20"] = df["close"].rolling(20).mean()
     df["volume_ma5"] = df["volume"].rolling(5).mean()
+    df["volume_ma20"] = df["volume"].rolling(20).mean()
 
     rolling_std = df["close"].rolling(20).std()
     df["bb_lower"] = df["ma20"] - (rolling_std * 2)
@@ -202,4 +232,11 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
     return df
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    if denominator in (0, None) or pd.isna(denominator):
+        return 0.0
+    return float(numerator) / float(denominator)

@@ -17,6 +17,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run KR and US market sessions for multiple days.")
     parser.add_argument("--days", type=float, default=3.0, help="How long to keep running. Default: 3 days.")
     parser.add_argument("--continue-on-error", action="store_true", help="Keep waiting for later sessions after a session error.")
+    parser.add_argument("--kis-interval", default="3.0", help="KIS request interval seconds.")
+    parser.add_argument("--max-slots", help="Deprecated: maximum slots for both markets.")
+    parser.add_argument("--kr-slots", default="3", help="Korean market slots.")
+    parser.add_argument("--us-slots", default="3", help="US market slots.")
+    parser.add_argument("--kr-total-budget", help="Optional KR total budget for slot sizing.")
+    parser.add_argument("--us-total-budget", help="Optional US total budget for slot sizing.")
+    parser.add_argument("--kr-batch-size", default="8", help="Korean session batch size.")
+    parser.add_argument("--us-batch-size", default="6", help="US session batch size.")
+    parser.add_argument("--kr-cycle-min", default="4", help="Korean session cycle reset minutes.")
+    parser.add_argument("--us-cycle-min", default="15", help="US session cycle reset minutes.")
+    parser.add_argument("--kr-scan-markets", default="KOSPI,KOSDAQ", help="External KR scanner markets.")
+    parser.add_argument("--kr-scan-top", default="1000", help="External KR scanner total universe size.")
+    parser.add_argument("--kr-scan-candidate-limit", default="30", help="External KR scanner candidate limit.")
+    parser.add_argument("--kr-full-scan-interval-min", default="5", help="External KR scanner repeat interval.")
     return parser
 
 
@@ -35,13 +49,13 @@ def main() -> int:
         next_kr_open = next_time("09:00", now)
 
         if is_between(now, "22:30", "05:00"):
-            exit_code = max(exit_code, run_us_session(wait_for_open=False))
+            exit_code = max(exit_code, run_us_session(args, wait_for_open=False))
             if exit_code and not args.continue_on_error:
                 return exit_code
             continue
 
         if is_between(now, "09:00", "15:30"):
-            exit_code = max(exit_code, run_kr_session(wait_for_open=False))
+            exit_code = max(exit_code, run_kr_session(args, wait_for_open=False))
             if exit_code and not args.continue_on_error:
                 return exit_code
             continue
@@ -50,12 +64,12 @@ def main() -> int:
             if next_us_open > end_at:
                 break
             wait_until(next_us_open, "US market open")
-            exit_code = max(exit_code, run_us_session(wait_for_open=False))
+            exit_code = max(exit_code, run_us_session(args, wait_for_open=False))
         else:
             if next_kr_open > end_at:
                 break
             wait_until(next_kr_open, "Korean market open")
-            exit_code = max(exit_code, run_kr_session(wait_for_open=False))
+            exit_code = max(exit_code, run_kr_session(args, wait_for_open=False))
 
         if exit_code and not args.continue_on_error:
             return exit_code
@@ -66,26 +80,29 @@ def main() -> int:
     return exit_code
 
 
-def run_us_session(wait_for_open: bool) -> int:
+def run_us_session(args: argparse.Namespace, wait_for_open: bool) -> int:
     cmd = [
         PYTHON,
         "scripts/run_us_rulebook_once.py",
         "--execute",
         "--until-us-close",
         "--batch-size",
-        "6",
+        args.us_batch_size,
         "--cycle-min",
-        "15",
+        args.us_cycle_min,
         "--repeat-interval-min",
         "0.1",
         "--report-on-close",
+        "--max-slots",
+        args.us_slots if not args.max_slots else args.max_slots,
     ]
+    cmd.extend(optional_arg("--total-budget", args.us_total_budget))
     if wait_for_open:
         cmd.append("--wait-for-us-open")
-    return run(cmd, "US market session")
+    return run(cmd, "US market session", args.kis_interval)
 
 
-def run_kr_session(wait_for_open: bool) -> int:
+def run_kr_session(args: argparse.Namespace, wait_for_open: bool) -> int:
     cmd = [
         PYTHON,
         "scripts/run_legacy_rulebook_once.py",
@@ -96,27 +113,58 @@ def run_kr_session(wait_for_open: bool) -> int:
         "100",
         "--no-prescreen",
         "--batch-size",
-        "8",
+        args.kr_batch_size,
         "--cycle-min",
-        "4",
+        args.kr_cycle_min,
         "--execute",
         "--until-kr-close",
         "--repeat-interval-min",
         "0.1",
         "--report-on-close",
+        "--max-slots",
+        args.kr_slots if not args.max_slots else args.max_slots,
     ]
+    cmd.extend(optional_arg("--total-budget", args.kr_total_budget))
     if wait_for_open:
         cmd.append("--wait-for-kr-open")
-    return run(cmd, "Korean market session")
+    scanner = start_kr_scanner(args)
+    try:
+        return run(cmd, "Korean market session", args.kis_interval)
+    finally:
+        if scanner.poll() is None:
+            scanner.terminate()
 
 
-def run(cmd: list[str], label: str) -> int:
+def start_kr_scanner(args: argparse.Namespace) -> subprocess.Popen:
+    cmd = [
+        PYTHON,
+        "scripts/scanner_kr.py",
+        "--repeat",
+        "--markets",
+        args.kr_scan_markets,
+        "--top",
+        args.kr_scan_top,
+        "--candidate-limit",
+        args.kr_scan_candidate_limit,
+        "--scan-interval-min",
+        args.kr_full_scan_interval_min,
+    ]
+    print("Starting external KR scanner.")
+    return subprocess.Popen(cmd, cwd=ROOT_DIR)
+
+
+def run(cmd: list[str], label: str, kis_interval: str) -> int:
     print("=" * 72)
     print(f"Starting {label}: {datetime.now():%Y-%m-%d %H:%M:%S}")
     print("=" * 72)
-    result = subprocess.run(cmd, cwd=ROOT_DIR)
+    env = {**dict(**__import__("os").environ), "KIS_MIN_INTERVAL": kis_interval}
+    result = subprocess.run(cmd, cwd=ROOT_DIR, env=env)
     print(f"{label} exited with code {result.returncode}")
     return result.returncode
+
+
+def optional_arg(name: str, value: str | None) -> list[str]:
+    return [name, value] if value else []
 
 
 def next_time(value: str, now: datetime) -> datetime:

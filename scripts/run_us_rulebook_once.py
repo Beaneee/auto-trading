@@ -49,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-guard", action="store_true", help="Block entries and use guarded stop loss.")
     parser.add_argument("--buy-slippage-pct", type=float, default=0.7, help="Buy limit above current price. Default: 0.7")
     parser.add_argument("--sell-slippage-pct", type=float, default=0.7, help="Sell limit below current price. Default: 0.7")
+    parser.add_argument("--max-slots", type=int, default=3, help="Maximum holding slots. Default: 3")
+    parser.add_argument("--total-budget", type=int, help="Optional total USD budget used for slot sizing.")
     return parser
 
 
@@ -127,6 +129,8 @@ def run_once(args: argparse.Namespace) -> int:
         market_guard_active=args.market_guard,
         buy_slippage_pct=args.buy_slippage_pct,
         sell_slippage_pct=args.sell_slippage_pct,
+        max_slots=args.max_slots,
+        total_budget=args.total_budget,
     )
 
     print(f"Account mode: {'real' if kis_config.is_real else 'sim'}")

@@ -36,6 +36,7 @@ DEFAULT_UNIVERSE = ROOT_DIR / "data" / "market_ohlcv" / "stock_universe_top100.c
 DEFAULT_WATCHLIST = ROOT_DIR / "data" / "watchlists" / "rulebook_focus.csv"
 STATE_DIR = ROOT_DIR / ".cache"
 SIGNAL_DIR = ROOT_DIR / "logs" / "signals"
+CANDIDATE_INBOX = ROOT_DIR / "signals" / "inbox" / "kr_candidates.jsonl"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Maximum number of non-held symbols to verify with KIS after local pre-screen. Default: 5",
+    )
+    parser.add_argument(
+        "--candidate-file",
+        default=str(CANDIDATE_INBOX),
+        help="External scanner candidate JSONL path.",
     )
     parser.add_argument(
         "--no-prescreen",
@@ -137,6 +143,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help="Maximum Korean tier-2 watchlist size. Default: 30",
+    )
+    parser.add_argument(
+        "--max-slots",
+        type=int,
+        default=3,
+        help="Maximum holding slots. Default: 3",
+    )
+    parser.add_argument(
+        "--total-budget",
+        type=int,
+        help="Optional total KRW budget used for slot sizing. Defaults to account total value.",
     )
     parser.add_argument(
         "--scan-state",
@@ -245,6 +262,14 @@ def run_once(args: argparse.Namespace) -> int:
     snapshot = portfolio.get_snapshot()
 
     loaded_symbols = symbols
+    external_candidates = load_external_candidates(Path(args.candidate_file), args.candidate_limit)
+    if external_candidates:
+        print(f"External scanner candidates: {', '.join(external_candidates)}")
+        for symbol in external_candidates:
+            add_tier2_symbol(symbol, "external_scanner", max_symbols=args.tier2_size)
+        symbols = _dedupe([*external_candidates, *symbols])
+        loaded_symbols = _dedupe([*external_candidates, *loaded_symbols])
+
     if args.batch_size:
         symbols = select_batch(
             symbols=symbols,
@@ -279,6 +304,8 @@ def run_once(args: argparse.Namespace) -> int:
         symbols=symbols,
         snapshot=snapshot,
         market_guard_active=args.market_guard,
+        max_slots=args.max_slots,
+        total_budget=args.total_budget,
     )
 
     print(f"Account mode: {'real' if kis_config.is_real else 'sim'}")
@@ -410,6 +437,26 @@ def load_json(path: Path) -> dict:
 def save_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def load_external_candidates(path: Path, limit: int) -> list[str]:
+    if limit <= 0 or not path.exists():
+        return []
+    candidates: list[tuple[int, str]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                symbol = str(data.get("code") or data.get("symbol") or "").strip().zfill(6)
+                score = int(data.get("score") or 0)
+                if symbol:
+                    candidates.append((score, symbol))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+    candidates.sort(reverse=True)
+    return _dedupe([symbol for _, symbol in candidates])[:limit]
 
 
 def log_signal_candidates(decisions) -> None:

@@ -10,6 +10,7 @@ from order.executor import OrderSide
 from order.overseas_executor import OverseasOrderRequest
 from order.portfolio import Holding, PortfolioSnapshot
 from strategy.legacy_rulebook import _add_indicators
+from strategy.legacy_rulebook import _safe_ratio
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class OverseasRulebookStrategy:
     take_profit_pct = 1.0
     stop_loss_pct = -2.5
     guarded_stop_loss_pct = -1.0
+    volume_surge_ratio = 1.8
 
     def __init__(
         self,
@@ -41,6 +43,8 @@ class OverseasRulebookStrategy:
         market_guard_active: bool = False,
         buy_slippage_pct: float = 0.7,
         sell_slippage_pct: float = 0.7,
+        max_slots: int = 3,
+        total_budget: int | None = None,
     ):
         self.market = market
         self.symbols = [(symbol.upper(), exchange.upper()) for symbol, exchange in symbols]
@@ -48,10 +52,13 @@ class OverseasRulebookStrategy:
         self.market_guard_active = market_guard_active
         self.buy_slippage_pct = buy_slippage_pct
         self.sell_slippage_pct = sell_slippage_pct
+        self.max_slots = max_slots
+        self.total_budget = total_budget
 
     @property
     def slot_budget(self) -> int:
-        return self.snapshot.total_value // self.max_slots if self.max_slots > 0 else 0
+        total_value = self.total_budget if self.total_budget else self.snapshot.total_value
+        return total_value // self.max_slots if self.max_slots > 0 else 0
 
     @property
     def available_slots(self) -> int:
@@ -110,19 +117,29 @@ class OverseasRulebookStrategy:
         curr = df.iloc[-1]
         confirmations: list[str] = []
 
-        if prev["ma5"] <= prev["ma20"] and curr["ma5"] > curr["ma20"]:
-            confirmations.append("ma5 crossed above ma20")
-        if prev["low"] <= prev["bb_lower"] and curr["close"] > curr["open"]:
-            confirmations.append("bollinger lower-band bounce")
-        if (prev["rsi14"] <= 30 < curr["rsi14"]) or (prev["rsi14"] < 50 <= curr["rsi14"]):
-            confirmations.append("rsi momentum cross")
-        if prev["macd"] <= prev["macd_signal"] and curr["macd"] > curr["macd_signal"]:
-            confirmations.append("macd signal cross")
+        volume_ratio = _safe_ratio(curr["volume"], curr["volume_ma20"])
+        body_position = _safe_ratio(curr["close"] - curr["low"], curr["high"] - curr["low"])
+        prior_high = df["high"].iloc[-6:-1].max()
 
-        if curr["volume"] <= curr["volume_ma5"]:
-            return OverseasDecision(symbol, exchange, None, 0, 0, ["volume below 5-day average"], len(confirmations))
-        if len(confirmations) < 2:
-            return OverseasDecision(symbol, exchange, None, 0, 0, confirmations or ["less than 2 confirmations"], len(confirmations))
+        if volume_ratio >= self.volume_surge_ratio:
+            confirmations.append(f"volume surge {volume_ratio:.1f}x")
+        if curr["close"] > curr["open"] and body_position >= 0.65:
+            confirmations.append("bullish close near high")
+        if curr["close"] > prior_high:
+            confirmations.append("breakout above recent high")
+        if curr["close"] > curr["ma5"] and curr["ma5"] >= curr["ma20"]:
+            confirmations.append("price above rising short trend")
+        if curr["rsi14"] > prev["rsi14"] and curr["rsi14"] >= 50:
+            confirmations.append("rsi improving above 50")
+        if curr["macd_hist"] > prev["macd_hist"] and curr["macd_hist"] > 0:
+            confirmations.append("macd momentum expanding")
+
+        has_volume_surge = any(reason.startswith("volume surge") for reason in confirmations)
+        bullish_score = len(confirmations) - (1 if has_volume_surge else 0)
+        if not has_volume_surge:
+            return OverseasDecision(symbol, exchange, None, 0, 0, confirmations or [f"no volume surge {volume_ratio:.1f}x"], len(confirmations))
+        if bullish_score < 2:
+            return OverseasDecision(symbol, exchange, None, 0, 0, confirmations or ["volume surge without bullish confirmation"], len(confirmations))
 
         limit_price = round(current_price * (1 + self.buy_slippage_pct / 100), 2)
         quantity = self._buy_quantity(limit_price)
@@ -140,6 +157,19 @@ class OverseasRulebookStrategy:
 
         if profit_rate <= stop_loss:
             return OverseasDecision(symbol, exchange, OrderSide.SELL, holding.quantity, limit_price, [f"stop loss {profit_rate:.2f}% <= {stop_loss:.2f}%"])
+        volume_fade = curr["volume"] < curr["volume_ma5"] and curr["volume"] < prev["volume"]
+        momentum_fade = curr["macd_hist"] < prev["macd_hist"] or curr["rsi14"] < prev["rsi14"]
+        trend_break = curr["close"] < curr["ma5"]
+
+        if profit_rate > 0 and trend_break and (volume_fade or momentum_fade):
+            reasons = [f"momentum fade exit {profit_rate:.2f}%"]
+            if volume_fade:
+                reasons.append("volume fading")
+            if momentum_fade:
+                reasons.append("momentum weakening")
+            if trend_break:
+                reasons.append("close below ma5")
+            return OverseasDecision(symbol, exchange, OrderSide.SELL, holding.quantity, limit_price, reasons)
         if profit_rate >= self.take_profit_pct:
             if curr["close"] >= curr["ma5"]:
                 return OverseasDecision(symbol, exchange, None, 0, 0, [f"trend hold {profit_rate:.2f}%, close above ma5"])
