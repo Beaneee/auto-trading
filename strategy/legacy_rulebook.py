@@ -25,6 +25,7 @@ class RulebookDecision:
     quantity: int
     reasons: list[str]
     score: int = 0
+    replace_symbol: str | None = None
 
     @property
     def has_order(self) -> bool:
@@ -39,6 +40,9 @@ class LegacyRulebookStrategy(BaseStrategy):
     stop_loss_pct = -2.5
     guarded_stop_loss_pct = -1.0
     volume_surge_ratio = 1.8
+    replacement_min_score = 75
+    replacement_gap = 20
+    protected_profit_pct = 1.0
 
     def __init__(
         self,
@@ -101,7 +105,8 @@ class LegacyRulebookStrategy(BaseStrategy):
                 continue
 
             if open_buy_slots <= 0:
-                decisions.append(RulebookDecision(symbol, None, 0, ["no empty slot"]))
+                replacement = self._replacement_decision(symbol, df)
+                decisions.append(replacement if replacement else RulebookDecision(symbol, None, 0, ["no empty slot"]))
                 continue
 
             decision = self._entry_decision(symbol, df)
@@ -123,32 +128,71 @@ class LegacyRulebookStrategy(BaseStrategy):
         body_position = _safe_ratio(curr["close"] - curr["low"], curr["high"] - curr["low"])
         prior_high = df["high"].iloc[-6:-1].max()
 
-        if volume_ratio >= self.volume_surge_ratio:
-            confirmations.append(f"volume surge {volume_ratio:.1f}x")
-        if curr["close"] > curr["open"] and body_position >= 0.65:
-            confirmations.append("bullish close near high")
-        if curr["close"] > prior_high:
-            confirmations.append("breakout above recent high")
-        if curr["close"] > curr["ma5"] and curr["ma5"] >= curr["ma20"]:
-            confirmations.append("price above rising short trend")
-        if curr["rsi14"] > prev["rsi14"] and curr["rsi14"] >= 50:
-            confirmations.append("rsi improving above 50")
-        if curr["macd_hist"] > prev["macd_hist"] and curr["macd_hist"] > 0:
-            confirmations.append("macd momentum expanding")
+        candidate_score, confirmations = score_momentum_candidate(df)
 
         has_volume_surge = any(reason.startswith("volume surge") for reason in confirmations)
         bullish_score = len(confirmations) - (1 if has_volume_surge else 0)
         if not has_volume_surge:
-            return RulebookDecision(symbol, None, 0, confirmations or [f"no volume surge {volume_ratio:.1f}x"], len(confirmations))
+            return RulebookDecision(symbol, None, 0, confirmations or [f"no volume surge {volume_ratio:.1f}x"], candidate_score)
 
         if bullish_score < 2:
-            return RulebookDecision(symbol, None, 0, confirmations or ["volume surge without bullish confirmation"], len(confirmations))
+            return RulebookDecision(symbol, None, 0, confirmations or ["volume surge without bullish confirmation"], candidate_score)
 
         quantity = self._buy_quantity(curr["close"])
         if quantity <= 0:
-            return RulebookDecision(symbol, None, 0, ["slot budget or cash is too small"], len(confirmations))
+            return RulebookDecision(symbol, None, 0, ["slot budget or cash is too small"], candidate_score)
 
-        return RulebookDecision(symbol, OrderSide.BUY, quantity, confirmations, len(confirmations))
+        return RulebookDecision(symbol, OrderSide.BUY, quantity, confirmations, candidate_score)
+
+    def _replacement_decision(self, symbol: str, df: pd.DataFrame) -> RulebookDecision | None:
+        candidate_score, reasons = score_momentum_candidate(df)
+        has_volume_surge = any(reason.startswith("volume surge") for reason in reasons)
+        bullish_score = len(reasons) - (1 if has_volume_surge else 0)
+        if candidate_score < self.replacement_min_score or not has_volume_surge or bullish_score < 2:
+            return None
+
+        weakest_symbol, weakest_holding, weakest_score, weakest_reasons = self._weakest_holding()
+        if weakest_holding is None:
+            return None
+        if weakest_holding.profit_rate >= self.protected_profit_pct and weakest_score >= 60:
+            return None
+        gap = candidate_score - weakest_score
+        if gap < self.replacement_gap:
+            return None
+
+        quantity = self._buy_quantity(df.iloc[-1]["close"])
+        if quantity <= 0:
+            return RulebookDecision(symbol, None, 0, [f"replacement candidate score {candidate_score}, but no buy quantity"], candidate_score)
+        return RulebookDecision(
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=quantity,
+            reasons=[
+                f"replacement candidate score {candidate_score}",
+                f"replace {weakest_symbol} score {weakest_score}, gap {gap}",
+                *reasons,
+            ],
+            score=candidate_score,
+            replace_symbol=weakest_symbol,
+        )
+
+    def _weakest_holding(self) -> tuple[str | None, Holding | None, int, list[str]]:
+        weakest_symbol = None
+        weakest_holding = None
+        weakest_score = 101
+        weakest_reasons: list[str] = []
+        for symbol, holding in self.snapshot.holdings.items():
+            try:
+                df = self._load_ohlcv(symbol)
+                score, reasons = score_holding_strength(df, holding)
+            except Exception:
+                score, reasons = 0, ["holding score unavailable"]
+            if score < weakest_score:
+                weakest_symbol = symbol
+                weakest_holding = holding
+                weakest_score = score
+                weakest_reasons = reasons
+        return weakest_symbol, weakest_holding, weakest_score, weakest_reasons
 
     def _exit_decision(self, symbol: str, holding: Holding, df: pd.DataFrame) -> RulebookDecision:
         prev = df.iloc[-2]
@@ -240,3 +284,99 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     if denominator in (0, None) or pd.isna(denominator):
         return 0.0
     return float(numerator) / float(denominator)
+
+
+def score_momentum_candidate(df: pd.DataFrame) -> tuple[int, list[str]]:
+    score, reasons, _ = score_momentum_candidate_detail(df)
+    return score, reasons
+
+
+def score_momentum_candidate_detail(df: pd.DataFrame) -> tuple[int, list[str], list[tuple[str, int]]]:
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+    score = 0
+    reasons: list[str] = []
+    details: list[tuple[str, int]] = []
+    volume_ratio = _safe_ratio(curr["volume"], curr["volume_ma20"])
+    body_position = _safe_ratio(curr["close"] - curr["low"], curr["high"] - curr["low"])
+    prior_high = df["high"].iloc[-6:-1].max()
+
+    if volume_ratio >= 1.8:
+        score += 25
+        reasons.append(f"volume surge {volume_ratio:.1f}x")
+        details.append((f"volume surge {volume_ratio:.1f}x", 25))
+    if volume_ratio >= 3.0:
+        score += 10
+        reasons.append("major volume expansion")
+        details.append(("major volume expansion", 10))
+    if curr["close"] > curr["open"] and body_position >= 0.65:
+        score += 15
+        reasons.append("bullish close near high")
+        details.append(("bullish close near high", 15))
+    if curr["close"] > prior_high:
+        score += 20
+        reasons.append("breakout above recent high")
+        details.append(("breakout above recent high", 20))
+    if curr["close"] > curr["ma5"] and curr["ma5"] >= curr["ma20"]:
+        score += 10
+        reasons.append("price above rising short trend")
+        details.append(("price above rising short trend", 10))
+    if curr["rsi14"] > prev["rsi14"] and curr["rsi14"] >= 50:
+        score += 10
+        reasons.append("rsi improving above 50")
+        details.append(("rsi improving above 50", 10))
+    if curr["macd_hist"] > prev["macd_hist"] and curr["macd_hist"] > 0:
+        score += 10
+        reasons.append("macd momentum expanding")
+        details.append(("macd momentum expanding", 10))
+    return min(score, 100), reasons, details
+
+
+def score_holding_strength(df: pd.DataFrame, holding: Holding) -> tuple[int, list[str]]:
+    score, reasons, _ = score_holding_strength_detail(df, holding)
+    return score, reasons
+
+
+def score_holding_strength_detail(df: pd.DataFrame, holding: Holding) -> tuple[int, list[str], list[tuple[str, int]]]:
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+    score = 50
+    reasons: list[str] = []
+    details: list[tuple[str, int]] = [("base holding score", 50)]
+    if holding.profit_rate > 0:
+        score += 10
+        reasons.append("profitable")
+        details.append(("profitable", 10))
+    else:
+        score -= 10
+        reasons.append("losing")
+        details.append(("losing", -10))
+    if curr["close"] >= curr["ma5"]:
+        score += 15
+        reasons.append("above ma5")
+        details.append(("above ma5", 15))
+    else:
+        score -= 20
+        reasons.append("below ma5")
+        details.append(("below ma5", -20))
+    if curr["rsi14"] >= prev["rsi14"]:
+        score += 10
+        reasons.append("rsi stable")
+        details.append(("rsi stable", 10))
+    else:
+        score -= 10
+        reasons.append("rsi weakening")
+        details.append(("rsi weakening", -10))
+    if curr["macd_hist"] >= prev["macd_hist"]:
+        score += 10
+        reasons.append("macd stable")
+        details.append(("macd stable", 10))
+    else:
+        score -= 10
+        reasons.append("macd weakening")
+        details.append(("macd weakening", -10))
+    if curr["volume"] >= curr["volume_ma5"]:
+        score += 5
+        reasons.append("volume supported")
+        details.append(("volume supported", 5))
+    return max(0, min(score, 100)), reasons, details

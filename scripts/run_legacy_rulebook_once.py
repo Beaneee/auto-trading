@@ -24,11 +24,13 @@ if str(ROOT_DIR) not in sys.path:
 from config.settings import kis_config
 from kis.client import KISClient
 from kis.market import MarketAPI
-from order.executor import OrderExecutor, OrderRequest, OrderType
+from order.executor import OrderExecutor, OrderRequest, OrderSide, OrderType
 from order.portfolio import Portfolio
 from strategy.legacy_rulebook import LegacyRulebookStrategy
+from strategy.legacy_rulebook import score_holding_strength_detail
 from strategy.local_prescreen import DEFAULT_5M_CSV, describe_prescreen, prescreen_from_5m_csv
 from utils.tier2_watchlist import add_tier2_symbol, load_tier2_symbols
+from utils.score_store import save_score
 from utils.trade_log import log_order
 
 
@@ -159,6 +161,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--scan-state",
         default=str(STATE_DIR / "kr_scan_state.json"),
         help="Path for remembering the next universe scan offset.",
+    )
+    parser.add_argument(
+        "--replacement-delay-sec",
+        type=float,
+        default=5.0,
+        help="Seconds to wait between replacement sell and buy orders. Default: 5",
     )
     parser.set_defaults(batch_offset=0)
     return parser
@@ -321,6 +329,13 @@ def run_once(args: argparse.Namespace) -> int:
     print()
 
     decisions = strategy.generate_decisions()
+    for symbol, holding in snapshot.holdings.items():
+        try:
+            df = strategy._load_ohlcv(symbol)
+            score, reasons, details = score_holding_strength_detail(df, holding)
+            save_score("kr", symbol, "holding", score, details, reasons)
+        except Exception:
+            pass
     orders = [decision for decision in decisions if decision.has_order]
     signal_candidates = [decision for decision in decisions if decision.score >= 2 and not decision.has_order]
     if signal_candidates:
@@ -344,6 +359,37 @@ def run_once(args: argparse.Namespace) -> int:
     print("\nSending orders...")
     exit_code = 0
     for decision in orders:
+        if decision.replace_symbol:
+            holding = snapshot.holdings.get(decision.replace_symbol)
+            if holding:
+                sell_order = OrderRequest(
+                    symbol=decision.replace_symbol,
+                    side=OrderSide.SELL,
+                    quantity=holding.quantity,
+                    price=0,
+                    order_type=OrderType.MARKET,
+                )
+                sell_result = executor.send(sell_order)
+                log_order(
+                    "kr",
+                    {
+                        "symbol": sell_order.symbol,
+                        "side": sell_order.side.value,
+                        "quantity": sell_order.quantity,
+                        "price": sell_order.price,
+                        "order_type": sell_order.order_type,
+                        "replacement_for": decision.symbol,
+                    },
+                    sell_result,
+                )
+                print(f"{sell_order.symbol} SELL qty={sell_order.quantity} replacement exit: {sell_result}")
+                if sell_result.get("rt_cd") != "0":
+                    exit_code = 1
+                    continue
+                add_tier2_symbol(sell_order.symbol, "replacement_sold", max_symbols=args.tier2_size)
+                print(f"Waiting {args.replacement_delay_sec:g}s before replacement buy...")
+                time.sleep(args.replacement_delay_sec)
+
         order = OrderRequest(
             symbol=decision.symbol,
             side=decision.side,

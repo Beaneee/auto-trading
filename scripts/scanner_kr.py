@@ -26,7 +26,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from strategy.legacy_rulebook import _add_indicators, _safe_ratio
+from strategy.legacy_rulebook import _add_indicators, score_momentum_candidate_detail
+from utils.score_store import save_score
 
 
 OUTBOX = ROOT_DIR / "signals" / "inbox" / "kr_candidates.jsonl"
@@ -50,6 +51,7 @@ class Candidate:
     rank: int
     score: int
     reasons: list[str]
+    details: list[tuple[str, int]]
     price: float
 
 
@@ -59,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top", type=int, default=1000, help="Total max symbols to scan after market merge. Default: 1000")
     parser.add_argument("--per-market-top", type=int, help="Optional max symbols per market before merge.")
     parser.add_argument("--candidate-limit", type=int, default=30, help="Max candidates to write. Default: 30")
-    parser.add_argument("--min-score", type=int, default=2, help="Minimum scanner score. Default: 2")
+    parser.add_argument("--min-score", type=int, default=70, help="Minimum scanner score. Default: 70")
     parser.add_argument("--workers", type=int, default=16, help="Crawler threads. Default: 16")
     parser.add_argument("--count", type=int, default=120, help="Minute bars to fetch per symbol. Default: 120")
     parser.add_argument("--out", default=str(OUTBOX), help="Output JSONL path.")
@@ -148,8 +150,8 @@ def scan_stock(stock: Stock, count: int) -> Candidate | None:
     scored = _score_rows(df)
     if not scored:
         return None
-    score, reasons, price = scored
-    return Candidate(stock.code, stock.name, stock.market, stock.rank, score, reasons, price)
+    score, reasons, details, price = scored
+    return Candidate(stock.code, stock.name, stock.market, stock.rank, score, reasons, details, price)
 
 
 def fetch_minute_ohlcv(code: str, count: int) -> pd.DataFrame:
@@ -177,30 +179,10 @@ def fetch_minute_ohlcv(code: str, count: int) -> pd.DataFrame:
     return df
 
 
-def _score_rows(rows: pd.DataFrame) -> tuple[int, list[str], float] | None:
+def _score_rows(rows: pd.DataFrame) -> tuple[int, list[str], list[tuple[str, int]], float] | None:
     df = _add_indicators(rows)
-    prev = df.iloc[-2]
-    curr = df.iloc[-1]
-
-    reasons: list[str] = []
-    volume_ratio = _safe_ratio(curr["volume"], curr["volume_ma20"])
-    body_position = _safe_ratio(curr["close"] - curr["low"], curr["high"] - curr["low"])
-    prior_high = df["high"].iloc[-6:-1].max()
-
-    if volume_ratio >= 1.8:
-        reasons.append(f"volume surge {volume_ratio:.1f}x")
-    if curr["close"] > curr["open"] and body_position >= 0.65:
-        reasons.append("bullish close near high")
-    if curr["close"] > prior_high:
-        reasons.append("breakout above recent high")
-    if curr["close"] > curr["ma5"] and curr["ma5"] >= curr["ma20"]:
-        reasons.append("price above rising short trend")
-    if curr["rsi14"] > prev["rsi14"] and curr["rsi14"] >= 50:
-        reasons.append("rsi improving above 50")
-    if curr["macd_hist"] > prev["macd_hist"] and curr["macd_hist"] > 0:
-        reasons.append("macd momentum expanding")
-
-    return len(reasons), reasons or ["no trigger"], float(curr["close"])
+    score, reasons, details = score_momentum_candidate_detail(df)
+    return score, reasons or ["no trigger"], details, float(df.iloc[-1]["close"])
 
 
 def write_candidates(candidates: list[Candidate], path: Path, started: datetime) -> None:
@@ -222,6 +204,14 @@ def write_candidates(candidates: list[Candidate], path: Path, started: datetime)
                     ensure_ascii=False,
                 )
                 + "\n"
+            )
+            save_score(
+                "kr",
+                item.code,
+                "candidate",
+                item.score,
+                item.details,
+                item.reasons,
             )
 
 
